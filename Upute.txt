@@ -1,0 +1,27 @@
+Pokretanje sample.py:
+        conda activate pcla-win
+        cd C:\Users\Antonela\Documents\PCLA-main
+        python sample.py
+
+Dodavanje pješaka i vozila:
+        conda activate pcla-win
+        cd C:\Users\Antonela\Documents\CARLA_0.9.16\PythonAPI\examples
+        python generate_traffic.py --number-of-vehicles 5 --number-of-walkers 3 --tm-port 8000
+
+Varijable shella:
+        step — broj iteracije simulacije
+        speed — trenutna brzina vozila
+        steer — komanda volana
+        throttle — gas
+        brake — kočnica
+        x — X koordinata vozila na mapi
+        y — Y koordinata vozila na mapi
+        yaw — smjer/orijentacija vozila
+        yaw_error — razlika između smjera vozila i smjera ceste ispred
+        lateral_error — bočno odstupanje vozila od centra trake
+        lookahead — udaljenost waypointa ispred vozila koji PID prati
+        stuck_counter — brojač za detekciju zaglavljenog vozila
+        recovery_timer — timer aktivnog PID recovery moda
+        stable — broj uzastopnih stabilnih tickova
+        exit_guard — timer dodatne stabilizacije nakon izlaska iz zavoja
+        cooldown — timer ograničavanja baseline agenta nakon recoveryja
