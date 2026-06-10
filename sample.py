@@ -13,59 +13,6 @@ def normalize_angle_deg(angle):
         angle += 360.0
     return angle
 
-# Koristi se za detekciju objekata uz desni rub
-def detect_front_right_obstacle(world, ego_vehicle,
-                                max_forward=8.0,
-                                min_right=0.8,
-                                max_right=3.2,
-                                max_height_diff=2.5):
-    ego_tf = ego_vehicle.get_transform()
-    ego_loc = ego_tf.location
-    forward = ego_tf.get_forward_vector()
-    right = ego_tf.get_right_vector()
-
-    best = None
-    best_dist = 1e9
-
-    for actor in world.get_actors():
-        if actor.id == ego_vehicle.id:
-            continue
-
-        tid = actor.type_id
-
-        # Gledamo objekte koji mogu biti uz cestu ili ispred auta
-        if not (
-            tid.startswith("static.") or
-            tid.startswith("traffic.")
-        ):
-            continue
-
-        loc = actor.get_location()
-
-        rel_x = loc.x - ego_loc.x
-        rel_y = loc.y - ego_loc.y
-        rel_z = loc.z - ego_loc.z
-
-        if abs(rel_z) > max_height_diff:
-            continue
-
-        local_forward = rel_x * forward.x + rel_y * forward.y + rel_z * forward.z
-        local_right = rel_x * right.x + rel_y * right.y + rel_z * right.z
-        dist = (rel_x**2 + rel_y**2 + rel_z**2) ** 0.5
-
-        # Objekt mora biti ispred i malo desno od auta
-        if 0.0 < local_forward < max_forward and min_right < local_right < max_right:
-            if dist < best_dist:
-                best_dist = dist
-                best = {
-                    "actor": actor,
-                    "type_id": tid,
-                    "distance": dist,
-                    "local_forward": local_forward,
-                    "local_right": local_right
-                }
-
-    return best
 
 # Zamjena funkcije detect_front_actor
 def extract_dynamic_actor_facts(
@@ -255,13 +202,21 @@ def evaluate_vehicle_collision_risk(actor_facts, ego_vehicle):
 
         risk_level = "NONE"
 
-        if gap_m < 2.5 or ttc < 1.0:
+        approaching = closing_speed > 0.30
+
+        if gap_m < 2.5:
             risk_level = "EMERGENCY"
 
-        elif gap_m < 5.0 or ttc < 2.0:
+        elif gap_m < 4.0:
             risk_level = "BRAKE"
 
-        elif gap_m < 10.0 or ttc < 4.0:
+        elif approaching and gap_m < 5.0:
+            risk_level = "BRAKE"
+
+        elif approaching and ttc < 4.0:
+            risk_level = "CAUTION"
+
+        elif approaching and gap_m < 10.0:
             risk_level = "CAUTION"
 
         if risk_level != "NONE":
@@ -467,13 +422,6 @@ def evaluate_cross_traffic_risk(
 
 def main():
 
-    collision_log_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "collision_log.txt"
-    )
-
-    print(f"Collision log path: {collision_log_path}")
-
     HOST_IP = "localhost"
     client = carla.Client(HOST_IP, 2000)
     client.set_timeout(30.0)  # bilo je na 10
@@ -566,8 +514,6 @@ def main():
 
             print(collision_line)
 
-            with open(collision_log_path, "a", encoding="utf-8") as f:
-                f.write(collision_line + "\n")
 
         collision_sensor.listen(on_collision)
 
@@ -577,17 +523,7 @@ def main():
         agent = "neat_neat"  # bio je "simlingo_simlingo" ali ne radi kako treba
         route = "./route_spawn0.xml"  # bilo route = "./sample_route.xml"
         pcla = PCLA(agent, vehicle, route, client)
-        
-        # Lateralni PID kontrolira volan, a longitudinalni kontrolira brzinu/gas/kočenje.
-        pid_recovery_controller = VehiclePIDController(
-            vehicle,
-            args_lateral={'K_P': 2.40, 'K_D': 0.30, 'K_I': 0.02, 'dt': 0.05},
-            args_longitudinal={'K_P': 1.0, 'K_D': 0.0, 'K_I': 0.03, 'dt': 0.05},
-            offset=0.00,
-            max_throttle=0.30,
-            max_brake=0.35,
-            max_steering=0.55
-        )
+
         
         # Zasebni PID kontroler za održavanje smjera trake tijekom collision kočenja.
         # Ne koristi isti kontroler kao recovery jer PID interno pamti prethodne pogreške.
@@ -601,25 +537,28 @@ def main():
             max_steering=0.55
         )
 
-        recovery_timer = 0
-        recovery_stable_counter = 0
-       
-        # Dodatni guard nakon izlaska iz zavoja.
-        # Cilj: ne vratiti odmah kontrolu baseline agentu čim auto prođe zavoj.
-        exit_guard_timer = 0
-        baseline_cooldown_timer = 0
-       
 
-
-
+    
         print('\nSpawned the vehicle with model =', agent, ', press Ctrl+C to exit.\n')
 
         step = 0
-        stuck_counter = 0
+        last_collision_count = 0
+
+        # State za stabilnije držanje trake nakon aktivacije.
+        lane_recenter_was_active = False
+        last_shield_steer = 0.0
+        prev_lateral_error = 0.0
+        prev_final_steer = 0.0
+        recenter_hold_ticks = 0
+
        
         while True:
             try:
                 ego_action = pcla.get_action() # Ovdje dobivamo kontrolu od baseline agenta
+                
+                raw_steer = ego_action.steer
+                raw_throttle = ego_action.throttle
+                raw_brake = ego_action.brake
 
                 vel = vehicle.get_velocity()
                 speed_mps = (vel.x**2 + vel.y**2 + vel.z**2) ** 0.5
@@ -656,6 +595,18 @@ def main():
                     cross_traffic_risk is not None or
                     pedestrian_collision_risk is not None
                 )
+                
+                new_physical_collision = len(collision_events) > last_collision_count
+                
+                traffic_light_state = "NONE"
+
+                try:
+                    if vehicle.is_at_traffic_light():
+                        traffic_light = vehicle.get_traffic_light()
+                        if traffic_light is not None:
+                            traffic_light_state = str(traffic_light.get_state())
+                except Exception:
+                    traffic_light_state = "ERR"
 
                 facts = {
                     "speed_mps": speed_mps,
@@ -688,9 +639,11 @@ def main():
                         print("SHIELD: high-speed steering too large -> clamping left steer")
                         ego_action.steer = -max_steer
 
+                
                 # ==========================================
-                # SHIELD 3: PID RECOVERY MODE
+                # LOCAL LANE / WAYPOINT FACTS
                 # ==========================================
+             
                 current_wp = world.get_map().get_waypoint(
                     vehicle.get_location(),
                     project_to_road=True,
@@ -719,14 +672,25 @@ def main():
                     step += 1
                     continue
 
+                
+                
+                # ==========================================
+                # WAYPOINT / LANE DIAGNOSTICS
+                # ==========================================
+                wp_loc = current_wp.transform.location
+                wp_yaw = current_wp.transform.rotation.yaw
+
+                wp_lane_id = current_wp.lane_id
+                wp_road_id = current_wp.road_id
+                wp_section_id = current_wp.section_id
+                wp_lane_width = current_wp.lane_width
+                wp_is_junction = current_wp.is_junction
+                
                 current_yaw = vehicle.get_transform().rotation.yaw
                 veh_loc = vehicle.get_transform().location
-                lane_center = current_wp.transform.location
 
-                # Lookahead: kraći kad je auto spor ili nestabilan, dulji kad se stabilizira
-                if recovery_timer > 0:
-                    lookahead_distance = 5.0
-                elif speed_mps < 1.0:
+                
+                if speed_mps < 1.0:
                     lookahead_distance = 4.0
                 elif speed_mps < 2.0:
                     lookahead_distance = 6.0
@@ -735,311 +699,433 @@ def main():
 
                 next_wps = current_wp.next(lookahead_distance)
 
+                if len(next_wps) > 0:
+                    pid_target_wp = next_wps[0]
+                else:
+                    pid_target_wp = None
+                    
                 yaw_error = 0.0
                 lateral_error = 0.0
 
-                if len(next_wps) > 0:
-                    target_yaw = next_wps[0].transform.rotation.yaw
+                # Yaw gledamo prema waypointu ispred vozila,
+                # jer time znamo dolazi li zavoj.
+                if pid_target_wp is not None:
+                    target_yaw = pid_target_wp.transform.rotation.yaw
                     yaw_error = normalize_angle_deg(target_yaw - current_yaw)
+
+                # Lateralno centriranje NE smije koristiti lookahead waypoint.
+                # Centar trake mora biti trenutni current_wp, inače vozilo u zavoju
+                # počne ciljati točku predaleko ispred i bježi prema rubu/trotoaru.
+                lane_center = current_wp.transform.location
 
                 dx = lane_center.x - veh_loc.x
                 dy = lane_center.y - veh_loc.y
 
-                yaw_rad = math.radians(current_yaw)
-                right_x = -math.sin(yaw_rad)
-                right_y = math.cos(yaw_rad)
+                wp_right = current_wp.transform.get_right_vector()
 
-                # Pozitivno: centar trake je desno od auta
-                # Negativno: centar trake je lijevo od auta
-                # Ako je auto otišao prema desnom trotoaru, često će lateral_error biti negativan.
-                lateral_error = dx * right_x + dy * right_y
+                lateral_error = (
+                    dx * wp_right.x +
+                    dy * wp_right.y
+                )
+                
+                # ==========================================
+                # MAP-BASED ROAD EDGE / SIDEWALK DETECTION
+                # ==========================================
+                # Ne koristimo kameru, nego CARLA mapu:
+                # ako s jedne strane trenutne trake nema druge Driving trake,
+                # tu stranu tretiramo kao rub ceste / mogući trotoar.
 
-                # Negativan lateral_error znači da je centar trake lijevo od auta,
-                # tj. auto je pobjegao prema desnom rubu.
-                right_edge_risk = lateral_error < -0.35
-                right_edge_severe = lateral_error < -0.60
-                road_ahead_straight = abs(yaw_error) < 10.0
+                left_lane = current_wp.get_left_lane()
+                right_lane = current_wp.get_right_lane()
 
-                front_right_obstacle = None
-                front_right_hazard = False
+                left_is_driving = (
+                    left_lane is not None
+                    and left_lane.lane_type == carla.LaneType.Driving
+                )
 
+                right_is_driving = (
+                    right_lane is not None
+                    and right_lane.lane_type == carla.LaneType.Driving
+                )
+
+                left_is_road_edge = not left_is_driving
+                right_is_road_edge = not right_is_driving
+
+                # Po formuli lateral_error:
+                # negativan lateral_error znači da je vozilo desno od centra trake,
+                # pozitivan lateral_error znači da je vozilo lijevo od centra trake.
+                
+                near_right_sidewalk = (
+                    lateral_error < -0.15
+                    and right_is_road_edge
+                    and speed_mps > 0.8
+                )
+
+                near_left_sidewalk = (
+                    lateral_error > 0.15
+                    and left_is_road_edge
+                    and speed_mps > 0.8
+                )
+
+                # Prediktivna zaštita:
+                # Ako baseline već jako okreće prema strani gdje je rub ceste,
+                # ne čekamo da lateral_error naraste na 0.15+.
+                baseline_pushing_toward_right_edge = (
+                    right_is_road_edge
+                    and lateral_error < -0.03
+                    and raw_steer > 0.70
+                    and speed_mps > 1.2
+                )
+
+                baseline_pushing_toward_left_edge = (
+                    left_is_road_edge
+                    and lateral_error > 0.03
+                    and raw_steer < -0.70
+                    and speed_mps > 1.2
+                )
+
+                baseline_pushing_toward_sidewalk = (
+                    baseline_pushing_toward_right_edge or
+                    baseline_pushing_toward_left_edge
+                )
+
+                sidewalk_guard_active = (
+                    near_right_sidewalk or
+                    near_left_sidewalk or
+                    baseline_pushing_toward_sidewalk
+                )
+                # ==========================================
+                # SHIELD 3: CURVE ENTRY ASSIST
+                # ==========================================
+                # Blaga pomoć baseline agentu kada dolazi očiti zavoj.
+                # Ne koristi recovery timer i ne preuzima cijelu vožnju.
+                # Cilj: spriječiti da baseline ravno uđe u zavoj i zatim zakoči.
+
+                curve_assist_active = False
+
+                red_or_yellow_light = (
+                    "Red" in traffic_light_state or
+                    "Yellow" in traffic_light_state
+                )
+
+                curve_ahead = abs(yaw_error) > 18.0
+                too_far_from_lane_center = abs(lateral_error) > 0.12
+
+                # Baseline je problematičan ako ne skreće dovoljno
+                # ili skreće u suprotnom smjeru od zavoja.
+                baseline_wrong_or_weak_steer = (
+                    abs(raw_steer) < 0.16 or
+                    (yaw_error * raw_steer < 0.0)
+                )
+
+                # NAPOMENA: curve_assist je onesposobljen.
+                # Razlog: koristio je predznak yaw_error (od lookahead waypointa 8m ispred)
+                # za određivanje smjera volana. Na prijelazu iz ravnog dijela u zavoj
+                # taj predznak je NEPOUZDAN i davao je volan u KRIVOM smjeru
+                # (npr. steer=-0.135 dok je zavoj zahtijevao +0.13), pa je vozilo
+                # prvo skretalo na vanjski rub ("zakrene prelijevo"), a tek onda se ispravljalo.
+                # lane_recenter ispod bolje upravlja zavojem jer prioritetno koristi lateral_error.
                 if (
-                    recovery_timer == 0
-                    and exit_guard_timer == 0
-                    and baseline_cooldown_timer == 0
-                    and road_ahead_straight
+                    False
                     and not collision_risk_active
+                    and len(collision_events) == 0
+                    and not red_or_yellow_light
+                    and curve_ahead
+                    and abs(yaw_error) < 55.0
+                    and not too_far_from_lane_center
+                    and baseline_wrong_or_weak_steer
+                    and speed_mps < 5.5
+                    and not sidewalk_guard_active
                 ):
-                    front_right_obstacle = detect_front_right_obstacle(
-                        world,
-                        vehicle,
-                        max_forward=9.0 if speed_mps < 4.0 else 11.0,
-                        min_right=0.8,
-                        max_right=3.2
+                    curve_assist_active = True
+
+                    if abs(yaw_error) > 45.0:
+                        desired_curve_steer = yaw_error * 0.0038
+                    else:
+                        desired_curve_steer = yaw_error * 0.0050
+
+                    if desired_curve_steer > 0.16:
+                        desired_curve_steer = 0.16
+                    elif desired_curve_steer < -0.16:
+                        desired_curve_steer = -0.16
+
+                    # Ako baseline skreće u suprotnom smjeru od zavoja,
+                    # ne smijemo ga miješati s assistom jer oslabi korekciju.
+                    baseline_steering_against_curve = (
+                        yaw_error * raw_steer < 0.0
                     )
 
-              
-
-                if recovery_timer == 0 and exit_guard_timer == 0 and baseline_cooldown_timer == 0:
-
-                    if collision_risk_active:
-                        # Vozilo nije zapelo; zaustavljeno je zbog drugog sudionika.
-                        stuck_counter = 0
-
-                    elif facts["speed_mps"] < 0.2 and facts["throttle"] > 0.5:
-                        stuck_counter += 1
-
+                    if baseline_steering_against_curve:
+                        ego_action.steer = desired_curve_steer
                     else:
-                        stuck_counter = 0
+                        ego_action.steer = (
+                            0.20 * ego_action.steer
+                            + 0.80 * desired_curve_steer
+                        )
 
-                    if stuck_counter >= 20:
-                        print("SHIELD: vehicle appears stuck -> applying emergency brake")
-                        ego_action.throttle = 0.0
-                        ego_action.brake = 1.0
-                else:
-                    stuck_counter = 0
+                    if ego_action.steer > 0.16:
+                        ego_action.steer = 0.16
+                    elif ego_action.steer < -0.16:
+                        ego_action.steer = -0.16
 
+                    # Ako baseline bez razloga koči u zavoju, makni punu kočnicu,
+                    # ali nemoj agresivno ubrzavati.
+                    if raw_brake > 0.70:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = 0.12
 
-                if front_right_obstacle is not None:
-                    front_right_hazard = front_right_obstacle["distance"] < 8.0
+                    # U samom ulazu u zavoj smanji gas da skretanje bude mirnije.
+                    if ego_action.throttle > 0.15:
+                        ego_action.throttle = 0.15
 
-                low_speed = speed_mps < 0.8
-                very_low_speed = speed_mps < 0.35
-                route_turn_like = abs(yaw_error) > 8.0
-                strong_turn_like = abs(yaw_error) > 14.0
-                off_center = abs(lateral_error) > 0.50
-                very_off_center = abs(lateral_error) > 0.90
+                    print(
+                        f"SHIELD: curve entry assist active "
+                        f"(yaw_error={yaw_error:.2f}, "
+                        f"raw_steer={raw_steer:.3f}, "
+                        f"raw_brake={raw_brake:.3f}, "
+                        f"assist_steer={ego_action.steer:.3f})"
+                    )
+                    
+                    
+                    
+                    
+                # ==========================================
+                # SHIELD 3B: CURVE / LANE CENTER HOLD
+                # ==========================================
+                # Aktivira se kada vozilo počne gubiti centar trake
+                # ili kada baseline u zavoju koči bez stvarnog rizika.
+                # Cilj: držati vozilo u sredini trake i nastaviti kroz zavoj,
+                # bez starog recovery PID sustava.
 
-                lane_width = current_wp.lane_width if current_wp is not None else 3.5
-                near_lane_edge = abs(lateral_error) > (0.25 * lane_width)
+                lane_recenter_active = False
 
-                startup_grace_over = step >= 40
-                actual_stuck = stuck_counter >= 20
+                # Centriranje i "road-edge" guard.
+                # Ovo ne detektira trotoar kamerom, nego koristi geometriju trake:
+                # ako je ego predaleko od centra trake, tretiramo ga kao rizik približavanja rubu.
+                # Time se jednako sprječava odlazak prema trotoaru i odlazak prema suprotnoj traci.
+                # Malo ranije uključivanje jer se na slikama vidi da vozilo
+                # već na oko 0.30-0.40 m offseta ide vizualno preblizu rubu/trotoaru.
+                RECENTER_ON_THRESHOLD = 0.13
+                RECENTER_OFF_THRESHOLD = 0.04
+                RECENTER_RELEASE_YAW_THRESHOLD = 1.0
+                RECENTER_RELEASE_RAW_STEER_LIMIT = 0.45
 
-                need_recovery = (
-                    startup_grace_over
-                    and not collision_risk_active
-                    and exit_guard_timer == 0
-                    and baseline_cooldown_timer == 0
+                SOFT_EDGE_GUARD_THRESHOLD = 0.20
+                HARD_EDGE_GUARD_THRESHOLD = 0.50
+
+                lateral_error_delta = lateral_error - prev_lateral_error
+                moving_away_from_center = (lateral_error * lateral_error_delta) > 0.0
+                
+                # Kratko zadržavanje shielda nakon izlaza iz zavoja.
+                # Sprječava da baseline odmah preuzme s raw_steer=1.000.
+                if lane_recenter_was_active:
+                    if (
+                        abs(raw_steer) > 0.60
+                        or abs(yaw_error) > 0.6
+                        or abs(lateral_error) > 0.03
+                    ):
+                        recenter_hold_ticks = max(recenter_hold_ticks, 18)
+
+                soft_edge_guard_active = (
+                    abs(lateral_error) > SOFT_EDGE_GUARD_THRESHOLD or
+                    sidewalk_guard_active or
+                    (abs(lateral_error) > 0.18 and moving_away_from_center)
+                )
+                hard_edge_guard_active = abs(lateral_error) > HARD_EDGE_GUARD_THRESHOLD
+
+                # Baseline je opasan samo ako još uvijek daje jak volan dok nismo centrirani.
+                # Kada smo stvarno blizu centra, ne držimo shield aktivan samo zbog raw_steer=1.000,
+                # jer bi inače shield mogao nepotrebno dugo voziti sporo.
+                baseline_still_dangerous = (
+                    abs(raw_steer) > RECENTER_RELEASE_RAW_STEER_LIMIT
                     and (
-                        very_off_center or
-                        (off_center and low_speed) or
-                        (near_lane_edge and low_speed) or
-                        actual_stuck
+                        abs(lateral_error) > 0.03
+                        or abs(yaw_error) > 0.5
+                        or sidewalk_guard_active
+                        or baseline_pushing_toward_sidewalk
                     )
                 )
 
-                if recovery_timer == 0 and need_recovery:
-                    recovery_timer = 55
-                    recovery_stable_counter = 0
-
-                    print(
-                        f"SHIELD: PID recovery mode armed "
-                        f"(yaw_error={yaw_error:.2f}, lateral_error={lateral_error:.2f}, "
-                        f"speed={speed_mps:.2f}, stuck_counter={stuck_counter}, "
-                        f"baseline_steer={ego_action.steer:.3f})"
+                if lane_recenter_was_active:
+                    lane_or_curve_unstable = (
+                        abs(lateral_error) > RECENTER_OFF_THRESHOLD or
+                        abs(yaw_error) > RECENTER_RELEASE_YAW_THRESHOLD or
+                        baseline_still_dangerous or
+                        soft_edge_guard_active or
+                        recenter_hold_ticks > 0
+                    )
+                else:
+                    lane_or_curve_unstable = (
+                        abs(lateral_error) > RECENTER_ON_THRESHOLD or
+                        soft_edge_guard_active or
+                        (raw_brake > 0.70 and abs(yaw_error) > 18.0) or
+                        (abs(raw_steer) > 0.70 and abs(lateral_error) > 0.14)
                     )
 
-                
-                if recovery_timer > 0 and len(next_wps) > 0 and not collision_risk_active:                  
-                    target_wp = next_wps[0]
-                    # Sporije kad je jako izvan centra ili skoro stao,
-                    # malo brže kad se već vraća u traku.
-                    if very_off_center or very_low_speed:
-                        recovery_target_speed = 3.0
-                    elif strong_turn_like:
-                        recovery_target_speed = 4.0
-                    else:
-                        recovery_target_speed = 5.5
+                if (
+                    not collision_risk_active
+                    and len(collision_events) == 0
+                    and lane_or_curve_unstable
+                    and not curve_assist_active
+                ):
+                    lane_recenter_active = True
 
-                    recovery_control = pid_recovery_controller.run_step(
-                        target_speed=recovery_target_speed,  # km/h
-                        waypoint=target_wp
-                    )
+                    # Ako je yaw_error velik, vozilo još uvijek mora pratiti zavoj,
+                    # ali kod izlaza iz zavoja lateral_error mora imati prioritet.
+                    # U logu se vidi da je pri izlazu lateral_error rastao do oko +0.63,
+                    # a stari center_hold_steer od ~0.15 nije bio dovoljan da vozilo vrati u sredinu.
+                    same_direction_yaw_and_offset = (lateral_error * yaw_error) > 0.0
 
-                    ego_action = recovery_control
+                    # Vrlo bitno: kada je vozilo blizu ruba, yaw_error ne smije
+                    # poništiti lateralno centriranje. U zadnjem logu se vidjelo da
+                    # kod lateral_error oko 0.50 i yaw_error oko -55 sustav ponekad
+                    # oslabi ili čak okrene korekciju, pa se vozilo nepotrebno dugo
+                    # vozi uz rub. Zato je yaw doprinos ovdje namjerno ograničen.
+                    limited_yaw_term = yaw_error * 0.0010
+                    if limited_yaw_term > 0.045:
+                        limited_yaw_term = 0.045
+                    elif limited_yaw_term < -0.045:
+                        limited_yaw_term = -0.045
 
-                    aligned_with_lane = abs(yaw_error) < 7.0
-                    centered_in_lane = abs(lateral_error) < 0.50
-                    moving_ok = speed_mps > 0.9
-                    not_turning_hard_anymore = abs(yaw_error) < 7.0
+                    if hard_edge_guard_active:
+                        # Blizu ruba: povratak prema centru trake ima prioritet.
+                        recenter_steer = lateral_error * 0.52 + limited_yaw_term
 
-                    # Recovery se ne smije ugasiti nakon samo jednog dobrog framea.
-                    # Mora biti stabilan nekoliko tickova zaredom.
-                    if aligned_with_lane and centered_in_lane and moving_ok and not_turning_hard_anymore:
-                        recovery_stable_counter += 1
-                    else:
-                        recovery_stable_counter = 0
+                    elif sidewalk_guard_active:
+                        # Rub/trotoar: ranije uključivanje, jači gain.
+                        recenter_steer = lateral_error * 0.60 + limited_yaw_term
 
-                    if recovery_stable_counter >= 12:
-                        recovery_timer = 0
-                        recovery_stable_counter = 0
+                    elif abs(yaw_error) > 18.0:
+                        # U ZAVOJU: KLJUČNA PROMJENA.
+                        # Ne koristimo yaw_error za smjer volana jer mu je predznak
+                        # (od lookahead waypointa) nepouzdan na prijelazu i u oštrom zavoju.
+                        # Umjesto toga koristimo baseline raw_steer koji ZNA ispravan smjer
+                        # zavoja (u logu je raw_steer ispravno pozitivan kroz cijeli desni zavoj),
+                        # i na njega dodajemo lateralnu korekciju za centriranje.
+                        # raw_steer * scale = praćenje zavoja, lateral_error * gain = centriranje.
+                        curve_follow = raw_steer * 1.5
+                        centering = lateral_error * 0.45
+                        recenter_steer = curve_follow + centering
 
-                        # Nakon recoveryja ostajemo još kratko u PID kontroli.
-                        # Ovo sprječava da baseline odmah nakon zavoja ode prema trotoaru.
-                        exit_guard_timer = 35
-                        baseline_cooldown_timer = 40
-
-                        print("SHIELD: PID recovery released safely -> exit guard + cooldown armed")
-                    else:
-                        recovery_timer -= 1
-
-                        if recovery_timer <= 0:
-                            still_not_centered = abs(lateral_error) > 0.35
-                            still_not_aligned = abs(yaw_error) > 4.0
-                            still_too_slow = speed_mps < 0.8
-
-                            if still_not_centered or still_not_aligned or still_too_slow:
-                                # Ne vraćaj kontrolu baselineu ako auto još nije stabilan.
-                                recovery_timer = 25
-                                recovery_stable_counter = 0
-
-                                print(
-                                    f"SHIELD: recovery timeout but vehicle still unsafe -> extending recovery "
-                                    f"(yaw_error={yaw_error:.2f}, lateral_error={lateral_error:.2f}, speed={speed_mps:.2f})"
-                                )
-                            else:
-                                # Tek ako je stanje stvarno dovoljno dobro, prelazimo u exit guard.
-                                recovery_timer = 0
-                                recovery_stable_counter = 0
-                                exit_guard_timer = 35
-                                baseline_cooldown_timer = 40
-
-                                print("SHIELD: recovery timeout but vehicle acceptable -> exit guard armed")
-                # ==========================================
-                # SHIELD 4: EXIT GUARD AFTER CURVE
-                # ==========================================
-                # Ovo je dodatna stabilizacija nakon izlaska iz zavoja.
-                if recovery_timer == 0 and exit_guard_timer > 0 and len(next_wps) > 0 and not collision_risk_active:
-                    target_wp = next_wps[0]
-
-                    exit_control = pid_recovery_controller.run_step(
-                        target_speed=8.0,  # km/h, mirno izravnavanje nakon zavoja
-                        waypoint=target_wp
-                    )
-
-                    # Ograniči throttle da baseline/PID ne povuče auto prema rubu prebrzo.
-                    if exit_control.throttle > 0.38:
-                        exit_control.throttle = 0.38
-
-                    # Blago ograniči steer nakon zavoja da ne napravi nagli trzaj.
-                    if exit_control.steer > 0.40:
-                        exit_control.steer = 0.40
-                    elif exit_control.steer < -0.40:
-                        exit_control.steer = -0.40
-
-                    ego_action = exit_control
-                    exit_guard_timer -= 1
-
-                    if exit_guard_timer < 0:
-                        exit_guard_timer = 0
-
-                    print(
-                        f"SHIELD: exit guard active "
-                        f"(timer={exit_guard_timer}, yaw_error={yaw_error:.2f}, "
-                        f"lateral_error={lateral_error:.2f})"
-                    )            
-
-                # ==========================================
-                # SHIELD 5: BASELINE COOLDOWN / POST-CURVE STABILIZER
-                # ==========================================
-                # Stabilizira baseline da se ne popne na rub odmah nakon zavoja, ali samo ako auto još nije stabilan.
-                if recovery_timer == 0 and exit_guard_timer == 0 and baseline_cooldown_timer > 0 and len(next_wps) > 0  and not collision_risk_active:
-
-                    post_curve_not_stable = (
-                        abs(yaw_error) > 6.0 or
-                        abs(lateral_error) > 0.45
-                    )
-                    if post_curve_not_stable:
-                        # Auto još nije u stanju u kojem baseline inače dobro radi.
-                        # Zato još kratko koristimo PID, ali mirno i bez agresivnog skretanja.
-                        target_wp = next_wps[0]
-
-                        stabilizer_control = pid_recovery_controller.run_step(
-                            target_speed=8.0,
-                            waypoint=target_wp
-                        )
-
-                        if stabilizer_control.throttle > 0.35:
-                            stabilizer_control.throttle = 0.35
-
-                        if stabilizer_control.steer > 0.35:
-                            stabilizer_control.steer = 0.35
-                        elif stabilizer_control.steer < -0.35:
-                            stabilizer_control.steer = -0.35
-
-                        ego_action = stabilizer_control
-
-                        print(
-                            f"SHIELD: post-curve stabilizer active "
-                            f"(yaw_error={yaw_error:.2f}, lateral_error={lateral_error:.2f})"
-                        )
-
-                    else:
-                        # Tek sada baseline smije voziti, ali još bez agresivnih trzaja.
-                        if ego_action.throttle > 0.45:
-                            print("SHIELD: baseline cooldown -> throttle clamped")
-                            ego_action.throttle = 0.45
-
-                        if ego_action.steer > 0.30:
-                            print("SHIELD: baseline cooldown -> right steer clamped")
-                            ego_action.steer = 0.30
-                        elif ego_action.steer < -0.30:
-                            print("SHIELD: baseline cooldown -> left steer clamped")
-                            ego_action.steer = -0.30
-
-                    baseline_cooldown_timer -= 1
-
-                    if baseline_cooldown_timer < 0:
-                        baseline_cooldown_timer = 0
-
-
-                # ==========================================
-                # SHIELD 6: RIGHT-EDGE / SIDEWALK OBJECT GUARD
-                # ==========================================
-                if recovery_timer == 0 and exit_guard_timer == 0 and baseline_cooldown_timer == 0 and road_ahead_straight and not collision_risk_active:
-                    hazard_close = front_right_hazard
-                    should_guard_right_side = right_edge_risk or hazard_close
-
-                    if should_guard_right_side:
-                        strong_guard = right_edge_severe or (
-                            front_right_obstacle is not None and front_right_obstacle["distance"] < 5.5
-                        )
-
-                        if strong_guard:
-                            desired_left_bias = -0.22
-                            max_safe_throttle = 0.18
-                            extra_brake = 0.12
+                    elif abs(lateral_error) > 0.04:
+                        # Ulaz u zavoj ili ravni dio s malim offsetom.
+                        # Ako zavoj dolazi (yaw raste), koristimo raw_steer kao osnovu smjera
+                        # plus lateralnu korekciju; inače čisto lateralno centriranje.
+                        if abs(yaw_error) > 8.0:
+                            recenter_steer = raw_steer * 1.2 + lateral_error * 0.45
                         else:
-                            desired_left_bias = -0.10
-                            max_safe_throttle = 0.24
-                            extra_brake = 0.00
+                            recenter_steer = lateral_error * 0.50 + limited_yaw_term
 
-                        # Ne dopusti da baseline skreće desno prema trotoaru/objektu.
-                        ego_action.steer = min(ego_action.steer, desired_left_bias)
-
-                        if ego_action.throttle > max_safe_throttle:
-                            ego_action.throttle = max_safe_throttle
-
-                        if extra_brake > 0.0:
-                            ego_action.brake = max(ego_action.brake, extra_brake)
-
-                        if front_right_obstacle is not None:
-                            print(
-                                f"SHIELD: right-side object guard active "
-                                f"(type={front_right_obstacle['type_id']}, "
-                                f"dist={front_right_obstacle['distance']:.2f}, "
-                                f"forward={front_right_obstacle['local_forward']:.2f}, "
-                                f"right={front_right_obstacle['local_right']:.2f}, "
-                                f"lateral_error={lateral_error:.2f})"
-                            )
-                        else:
-                            print(
-                                f"SHIELD: right-edge guard active "
-                                f"(lateral_error={lateral_error:.2f})"
-                            )
+                    else:
+                        # Gotovo centrirani na ravnom: fina korekcija.
+                        recenter_steer = lateral_error * 0.42 + limited_yaw_term
                         
-             
+                        
+                    # Sigurnosna provjera: ako smo već jasno blizu ruba, finalna
+                    # korekcija ne smije biti u suprotnom smjeru od lateral_errora.
+                    if abs(lateral_error) > 0.26 and recenter_steer * lateral_error < 0.0:
+                        recenter_steer = lateral_error * 0.36
+
+                    if speed_mps < 2.5:
+                        if hard_edge_guard_active:
+                            max_center_steer = 0.45
+                        elif sidewalk_guard_active:
+                            max_center_steer = 0.42
+                        elif soft_edge_guard_active:
+                            max_center_steer = 0.40
+                        elif abs(yaw_error) > 18.0:
+                            # U zavoju treba više prostora za praćenje.
+                            max_center_steer = 0.38
+                        else:
+                            max_center_steer = 0.28
+                    else:
+                        if hard_edge_guard_active:
+                            max_center_steer = 0.40
+                        elif sidewalk_guard_active:
+                            max_center_steer = 0.37
+                        elif soft_edge_guard_active:
+                            max_center_steer = 0.36
+                        elif abs(yaw_error) > 18.0:
+                            # U zavoju treba više prostora za praćenje.
+                            max_center_steer = 0.34
+                        else:
+                            max_center_steer = 0.25
+
+                    if recenter_steer > max_center_steer:
+                        recenter_steer = max_center_steer
+                    elif recenter_steer < -max_center_steer:
+                        recenter_steer = -max_center_steer
+
+                    ego_action.steer = recenter_steer
+
+                    # Ako baseline bez rizika koči u zavoju, makni kočnicu.
+                    if raw_brake > 0.70 and not red_or_yellow_light:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = 0.14
+                    # Ne smije stati u zavoju.
+                    if speed_mps > 5.0 and (hard_edge_guard_active or abs(yaw_error) > 12.0):
+                        ego_action.throttle = 0.0
+                        ego_action.brake = max(ego_action.brake, 0.05)
+
+                    elif speed_mps > 3.5:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = 0.06
+
+                    elif speed_mps > 1.6:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = 0.16
+
+                    else:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = 0.20
+
+                    print(
+                        f"SHIELD: curve/lane center hold active "
+                        f"(lateral_error={lateral_error:.2f}, "
+                        f"yaw_error={yaw_error:.2f}, "
+                        f"raw_steer={raw_steer:.3f}, "
+                        f"raw_brake={raw_brake:.3f}, "
+                        f"lateral_delta={lateral_error_delta:.3f}, "
+                        f"soft_edge_guard={soft_edge_guard_active}, "
+                        f"sidewalk_guard={sidewalk_guard_active}, "
+                        f"hard_edge_guard={hard_edge_guard_active}, "
+                        f"center_hold_steer={ego_action.steer:.3f})"
+                    )
+                    
+                    
+                    
+                # Spremi zadnju shield korekciju za glatkiji povratak baselineu.
+                if curve_assist_active or lane_recenter_active:
+                    last_shield_steer = ego_action.steer
+
+                elif (
+                    abs(last_shield_steer) > 0.02
+                    and (
+                        abs(yaw_error) > 0.6
+                        or abs(lateral_error) > 0.03
+                        or abs(raw_steer) > 0.60
+                    )
+                ):
+                    # Ako se shield upravo ugasio, nemoj odmah potpuno vratiti baseline.
+                    # Ovo sprječava nagli skok natrag na raw_steer=1.000 pri izlazu.
+                    ego_action.steer = (
+                        0.60 * last_shield_steer +
+                        0.40 * ego_action.steer
+                    )
+
+                    last_shield_steer *= 0.60
+                    # Ne dopuštaj nagli puni gas odmah nakon što shield pusti kontrolu.
+                    if raw_throttle > 0.40 and speed_mps < 3.2:
+                        ego_action.throttle = min(ego_action.throttle, 0.25)
+
+                else:
+                    last_shield_steer = 0.0
+
+                if recenter_hold_ticks > 0:
+                    recenter_hold_ticks -= 1
+
+                prev_lateral_error = lateral_error
+                lane_recenter_was_active = lane_recenter_active   
                 # ==========================================
                 # SHIELD: COLLISION RISK OVERRIDE
                 # ==========================================
@@ -1098,10 +1184,10 @@ def main():
 
                 collision_lane_steer = ego_action.steer
 
-                if highest_risk is not None and len(next_wps) > 0:
+                if highest_risk is not None and pid_target_wp is not None:
                     lane_hold_control = collision_lane_controller.run_step(
                         target_speed=0.0,
-                        waypoint=next_wps[0]
+                        waypoint=pid_target_wp
                     )
 
                     collision_lane_steer = lane_hold_control.steer
@@ -1188,6 +1274,25 @@ def main():
                             ego_action.brake,
                             0.15
                         )
+            
+                # ==========================================
+                # STATIC COLLISION LOG
+                # ==========================================
+                # Ako collision sensor stalno javlja udar u statički objekt/trotoar,
+                # ne smijemo davati gas. Ovo nije dynamic collision risk, nego fizički kontakt.
+                if new_physical_collision and len(collision_events) > 0:
+                    last_event = collision_events[-1]
+                    other_type = last_event.get("other_actor_type", "")
+
+                    if other_type.startswith("static."):
+                        print(
+                            f"SHIELD: static collision detected "
+                            f"(type={other_type}, collision_count={len(collision_events)})"
+                        )
+
+                        
+                
+           
 
                 # ==========================================
                 # RISK LEVELI ZA GLAVNI LOG
@@ -1210,6 +1315,44 @@ def main():
                     if cross_traffic_risk is not None
                     else "NONE"
                 )
+                
+                
+                # ==========================================
+                # FINAL STEERING RATE LIMITER
+                # ==========================================
+                # Važno:
+                # - NE limitiramo steer dok je lane_recenter_active.
+                # - Shield mora smjeti odmah korigirati vozilo od ruba/trotoara.
+                # - Limiter koristimo samo kada baseline preuzima kontrolu.
+
+                if (
+                    not collision_risk_active
+                    and not lane_recenter_active
+                    and not curve_assist_active
+                ):
+                    desired_final_steer = ego_action.steer
+
+                    if speed_mps < 0.3:
+                        max_steer_delta = 0.035
+                    elif raw_brake > 0.70:
+                        max_steer_delta = 0.055
+                    elif speed_mps < 2.5:
+                        max_steer_delta = 0.075
+                    else:
+                        max_steer_delta = 0.10
+
+                    steer_delta = desired_final_steer - prev_final_steer
+
+                    if steer_delta > max_steer_delta:
+                        steer_delta = max_steer_delta
+                    elif steer_delta < -max_steer_delta:
+                        steer_delta = -max_steer_delta
+
+                    ego_action.steer = prev_final_steer + steer_delta
+
+                prev_final_steer = ego_action.steer
+                
+
 
                 print(
                     f"step={step} "
@@ -1220,20 +1363,36 @@ def main():
                     f"x={facts['x']:.2f} "
                     f"y={facts['y']:.2f} "
                     f"yaw={facts['yaw']:.2f} "
+                    f"wp_x={wp_loc.x:.2f} "
+                    f"wp_y={wp_loc.y:.2f} "
+                    f"wp_yaw={wp_yaw:.2f} "
+                    f"wp_lane_id={wp_lane_id} "
+                    f"wp_road_id={wp_road_id} "
+                    f"wp_section_id={wp_section_id} "
+                    f"wp_lane_width={wp_lane_width:.2f} "
+                    f"wp_junction={wp_is_junction} "
                     f"yaw_error={yaw_error:.2f} "
                     f"lateral_error={lateral_error:.2f} "
                     f"lookahead={lookahead_distance:.1f} "
-                    f"stuck_counter={stuck_counter} "
-                    f"recovery_timer={recovery_timer} "
-                    f"stable={recovery_stable_counter} "
-                    f"exit_guard={exit_guard_timer} "
-                    f"cooldown={baseline_cooldown_timer} "
                     f"collision_risk={collision_risk_active} "
                     f"vehicle_risk={vehicle_risk_level} "
                     f"pedestrian_risk={pedestrian_risk_level} "
                     f"collision_count={len(collision_events)} "
                     f"cross_traffic_risk={cross_traffic_risk_level} "
+                    f"raw_steer={raw_steer:.3f} "
+                    f"raw_throttle={raw_throttle:.3f} "
+                    f"raw_brake={raw_brake:.3f} "
+                    f"curve_assist={curve_assist_active} "
+                    f"lane_recenter={lane_recenter_active} "
+                    f"sidewalk_guard={sidewalk_guard_active} "
+                    f"soft_edge_guard={soft_edge_guard_active} "
+                    f"baseline_to_sidewalk={baseline_pushing_toward_sidewalk} "
+                    f"hard_edge_guard={hard_edge_guard_active} "
+                    f"recenter_hold={recenter_hold_ticks} "
+                    f"traffic_light={traffic_light_state} "
                 )
+
+                last_collision_count = len(collision_events)
 
                 vehicle.apply_control(ego_action)
                 world.tick()
