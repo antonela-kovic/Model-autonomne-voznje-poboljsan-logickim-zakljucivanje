@@ -1,14 +1,38 @@
+# --- Python ---
 __pycache__/
-plant_viz/
-pcla_agents/*pretrained*/
-wandb/
-pretrained/
-eval/
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
 env/
-.pytest_cache/
-.ipynb_checkpoints/
-pcla_agents/pretrained.zip
-.vscode
-pcla_agents/plant2/caz_data.npy
+
+# --- CARLA / velike binarne / generirane datoteke ---
+*.egg
+*.log
+*.mp4
+*.avi
+*.zip
+*.7z
+
+# --- Model weights (po potrebi otkomentiraj / prilagodi) ---
+# *.pth
+# *.pt
+# *.ckpt
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Generirani sažeci analize (NE rezultati testova) ---
+summary.csv
+summary_grouped.csv
+summary_*.csv
+
+pcla_agents/*_pretrained/
+
+# NAPOMENA:
+# tests/metrics_*.csv (rezultati mjerenja) se NAMJERNO gurnu na GitHub.
+# Ako su preveliki ili ih ne zelis u repou, dodaj liniju:
+# tests/metrics_*.csv

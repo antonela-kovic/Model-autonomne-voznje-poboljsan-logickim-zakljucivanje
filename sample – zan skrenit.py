@@ -583,8 +583,7 @@ def evaluate_intersection_priority_risk(
     ego_in_junction,
     junction_ahead,
     ego_turning_intent,
-    route_waypoints=None,
-    prediction_horizon=8.5
+    prediction_horizon=4.0
 ):
     """
     Zaseban safety sloj SAMO za raskrižje.
@@ -619,27 +618,6 @@ def evaluate_intersection_priority_risk(
 
     best_risk = None
 
-    # Tocke ego RUTE ispred ega (~12 m) = prostor kroz koji ce ego proci u
-    # raskrizju. Drugo vozilo je konflikt SAMO ako upadne na OVU putanju.
-    path_points = []
-    if route_waypoints:
-        nearest_i = 0
-        nearest_d2 = float("inf")
-        for idx, _wp in enumerate(route_waypoints):
-            d2 = (_wp["x"] - ego_location.x) ** 2 + (_wp["y"] - ego_location.y) ** 2
-            if d2 < nearest_d2:
-                nearest_d2 = d2
-                nearest_i = idx
-        accumulated = 0.0
-        for idx in range(nearest_i, len(route_waypoints) - 1):
-            path_points.append((route_waypoints[idx]["x"], route_waypoints[idx]["y"]))
-            accumulated += (
-                (route_waypoints[idx + 1]["x"] - route_waypoints[idx]["x"]) ** 2 +
-                (route_waypoints[idx + 1]["y"] - route_waypoints[idx]["y"]) ** 2
-            ) ** 0.5
-            if accumulated > 12.0:
-                break
-
     for actor_fact in actor_facts:
         if not actor_fact["is_vehicle"]:
             continue
@@ -672,43 +650,51 @@ def evaluate_intersection_priority_risk(
         # Vozilo mora biti dovoljno blizu da uopće bude relevantno za raskrižje.
         # Daleko vozilo na nekoj drugoj cesti ne smije izazvati propuštanje.
         current_distance = (rel_px**2 + rel_py**2) ** 0.5
-        if current_distance > 30.0:
+        if current_distance > 20.0:
             continue
 
-        # ---- KONFLIKT PREMA EGO PUTANJI (ne prema trenutnoj poziciji ega) ----
-        # Pitanje nije "koliko je vozilo blizu mene SADA" nego "hoce li vozilo
-        # upasti na putanju kojom cu ja proci kroz raskrizje". Mimoilazenje u
-        # susjednoj/suprotnoj traci (vozilo NE ulazi na ego rutu) se NE broji,
-        # a stvarni lijevi skret preko suprotne trake (vozilo ide ravno kroz
-        # tocku ego putanje) se broji ispravno.
-        ego_w = ego_vehicle.bounding_box.extent.y
-        actor_w = actor.bounding_box.extent.y
-        conflict_radius = ego_w + actor_w + 0.6
+        rel_vx = actor_velocity.x - ego_velocity.x
+        rel_vy = actor_velocity.y - ego_velocity.y
 
-        time_to_closest = None
-        closest_distance = float("inf")
+        relative_speed_sq = rel_vx**2 + rel_vy**2
 
-        if path_points:
-            t = 0.0
-            while t <= prediction_horizon:
-                ax = actor_location.x + actor_velocity.x * t
-                ay = actor_location.y + actor_velocity.y * t
-                dmin = float("inf")
-                for (px, py) in path_points:
-                    d = ((ax - px) ** 2 + (ay - py) ** 2) ** 0.5
-                    if d < dmin:
-                        dmin = d
-                if dmin < conflict_radius:
-                    time_to_closest = t
-                    closest_distance = dmin
-                    break
-                t += 0.25
-
-        if time_to_closest is None:
+        if relative_speed_sq < 0.01:
             continue
 
-        # STOP ako je vozilo skoro na putanji; YIELD ako ima nesto vremena.
-        risk_level = "STOP" if time_to_closest < 8.0 else "YIELD"
+        time_to_closest = -(
+            rel_px * rel_vx +
+            rel_py * rel_vy
+        ) / relative_speed_sq
+
+        if time_to_closest < 0.0 or time_to_closest > prediction_horizon:
+            continue
+
+        closest_x = rel_px + rel_vx * time_to_closest
+        closest_y = rel_py + rel_vy * time_to_closest
+
+        closest_distance = (
+            closest_x**2 +
+            closest_y**2
+        ) ** 0.5
+
+        actor_radius = max(
+            actor.bounding_box.extent.x,
+            actor.bounding_box.extent.y
+        )
+
+        safe_distance = ego_radius + actor_radius + 1.0
+
+        risk_level = "NONE"
+
+        # STOP: skori i bliski konflikt -> ego propušta i staje.
+        if closest_distance < safe_distance and time_to_closest < 2.0:
+            risk_level = "STOP"
+        # YIELD: konflikt postoji, ali ima vremena -> uspori i propusti.
+        elif closest_distance < safe_distance + 1.5 and time_to_closest < prediction_horizon:
+            risk_level = "YIELD"
+
+        if risk_level == "NONE":
+            continue
 
         candidate = {
             **actor_fact,
@@ -735,36 +721,6 @@ def evaluate_intersection_priority_risk(
 
 def main():
 
-    # Glavni prekidač za usporedbu: True = baseline + logički shield sloj,
-    # False = ČISTI baseline (neat_neat bez shielda). Ista ruta/kod/mjerenja.
-    SHIELD_ENABLED = True
-    # Ablacija gap-acceptancea (S7): True = shield propusta (normalno),
-    # False = shield skrece ali NE propusta -> ulijece u nasuprotno vozilo.
-    # Djeluje samo kad je SHIELD_ENABLED=True; ostatak shielda netaknut.
-    GAP_ACCEPTANCE_ENABLED = False
-
-    # --- Kontrolirani scenarij S7: nasuprotno vozilo koje presijeca ego skret ---
-    # Stoji na nasuprotnom prilazu dok ga ego ne "okine" (priblizi se raskrizju),
-    # pa krene RAVNO kroz raskrizje. Sluzi za ugadjanje gap-acceptance pravila.
-    SPAWN_ONCOMING = True         # True = ukljuci nasuprotno vozilo (S7 kalibracija; vrati na False za normalne voznje)
-    ONCOMING_SPAWN_INDEX = 45      # spawn na suprotnoj traci, sjeverno od raskrizja (presijeca ego lijevi skret)
-    ONCOMING_JUNCTION_WP = 26      # waypoint skreta rute na (0.5,191.5)
-    ONCOMING_TRIGGER_DIST = 14.0   # ego unutar ove udaljenosti od raskrizja -> pusti vozilo
-    ONCOMING_SPEED = float(os.environ.get("ONCOMING_SPEED", 8.0))  # m/s konstantna brzina; override: set ONCOMING_SPEED=6
-
-    # --- Kontrolirani scenarij S5: sporo/stojece vozilo U ISTOJ TRACI ispred ega ---
-    # Na ravnom prilazu PRIJE skreta (baseline tu vozi normalno) -> cist test koci li ego.
-    SPAWN_LEAD = False             # True = ukljuci vozilo ispred (S5)
-    LEAD_SPAWN_WP = 18             # route waypoint za spawn (wp ~2 m; 18 -> ~35 m ispred ega)
-    LEAD_SPEED = float(os.environ.get("LEAD_SPEED", 0.0))  # 0 = stoji; >0 = konstantna spora brzina (m/s)
-
-    # --- Kontrolirani scenarij S6: pjesak na ego putanji ---
-    SPAWN_PEDESTRIAN = False       # True = ukljuci pjesaka (S6)
-    PED_SPAWN_WP = 14              # route waypoint oko kojeg se pjesak postavlja (~27 m ispred)
-    PED_SIDE_OFFSET = -4.0         # poprecni pomak od sredine trake (m); 0 = stoji u traci
-    PED_TRIGGER_DIST = 12.0        # ego unutar ove udaljenosti -> pjesak krene prelaziti
-    PED_SPEED = float(os.environ.get("PED_SPEED", 1.5))   # m/s; 0 = samo stoji u traci
-
     HOST_IP = "localhost"
     client = carla.Client(HOST_IP, 2000)
     client.set_timeout(30.0)  # bilo je na 10
@@ -777,15 +733,10 @@ def main():
     world = None
     collision_sensor = None
     traffic_manager = None
-    oncoming_vehicle = None
-    lead_vehicle = None
-    pedestrian = None
 
     try:
         world = client.get_world()
         traffic_manager = client.get_trafficmanager(8000)
-        # Fiksni seed -> ponovljivo ponašanje prometa (isto u baseline i shield).
-        traffic_manager.set_random_device_seed(42)
 
         settings = world.get_settings()
         asynch = False
@@ -815,8 +766,8 @@ def main():
         vehicle_spawn_points = world.get_map().get_spawn_points()
 
         # Spawn vehicle
-        vehicle = world.spawn_actor(vehicleBP, vehicle_spawn_points[0]) # bilo je 31 izmjenjeno u 0
-        # vehicle = world.spawn_actor(vehicleBP, vehicle_spawn_points[6])   # bilo [0], raskrizja ruta
+        # vehicle = world.spawn_actor(vehicleBP, vehicle_spawn_points[0])  # bilo je 31 izmjenjeno u 0
+        vehicle = world.spawn_actor(vehicleBP, vehicle_spawn_points[6])   # bilo [0]
         
         # Kamera koja prati vozilo
         spectator = world.get_spectator()
@@ -870,8 +821,7 @@ def main():
         world.tick()
 
         agent = "neat_neat"  # bio je "simlingo_simlingo" ali ne radi kako treba
-        # route = "./route_intersection_test_1.xml"  # ruta sa raskrižjem
-        route = "./route_spawn0.xml"
+        route = "./route_intersection_test_1.xml"  # bilo route = "./sample_route.xml"
         pcla = PCLA(agent, vehicle, route, client)
 
         # ==========================================
@@ -913,30 +863,6 @@ def main():
         print('\nSpawned the vehicle with model =', agent, ', press Ctrl+C to exit.\n')
 
         step = 0
-
-        # CSV logger za usporedbu baseline vs shield (jedan redak po koraku).
-        if not SHIELD_ENABLED:
-            _mode = "baseline"
-        elif not GAP_ACCEPTANCE_ENABLED:
-            _mode = "shieldnogap"
-        else:
-            _mode = "shield"
-        if SPAWN_ONCOMING:
-            _csv_name = f"metrics_{_mode}_s7_v{int(round(ONCOMING_SPEED))}.csv"
-        elif SPAWN_LEAD:
-            _csv_name = f"metrics_{_mode}_s5.csv"
-        elif SPAWN_PEDESTRIAN:
-            _csv_name = f"metrics_{_mode}_s6.csv"
-        else:
-            _csv_name = f"metrics_{_mode}.csv"
-        _csv = open(_csv_name, "w", encoding="utf-8")
-        _csv.write(
-            "step,mode,x,y,yaw,speed,raw_steer,steer,raw_throttle,throttle,"
-            "raw_brake,brake,lateral_error,yaw_error,collision_count,"
-            "intersection_risk,ego_turning_intent,route_intent,"
-            "lane_recenter,junction_route_steer\n"
-        )
-        
         last_collision_count = 0
 
         # State za stabilnije držanje trake nakon aktivacije.
@@ -946,61 +872,8 @@ def main():
         prev_final_steer = 0.0
         recenter_hold_ticks = 0
         turn_start_yaw = None
-        turn_entry_yaw = None  # yaw na ulasku u skret (za napredak skreta)
         turn_planned_angle = 0.0
         pp_was_active = False
-        exit_recenter_counter = 0
-
-        # --- S7: kontrolirani spawn nasuprotnog vozila (stoji dok ga ego ne okine) ---
-        oncoming_released = False
-        if SPAWN_ONCOMING:
-            try:
-                _onc_bp = bpLibrary.filter("vehicle.tesla.model3")[0]
-                _onc_tf = vehicle_spawn_points[ONCOMING_SPAWN_INDEX]
-                oncoming_vehicle = world.try_spawn_actor(_onc_bp, _onc_tf)
-                if oncoming_vehicle is not None:
-                    oncoming_vehicle.apply_control(carla.VehicleControl(brake=1.0))
-                    print(f"S7: nasuprotno vozilo spawnano na spawn[{ONCOMING_SPAWN_INDEX}] loc={_onc_tf.location}")
-                else:
-                    print(f"S7: spawn nasuprotnog vozila NIJE uspio (zauzeto?) idx={ONCOMING_SPAWN_INDEX}")
-            except Exception as _e:
-                print(f"S7: greska pri spawnu nasuprotnog vozila: {_e}")
-
-        # --- S5: kontrolirani spawn vozila ispred (ista traka, ravni prilaz) ---
-        if SPAWN_LEAD and route_waypoints:
-            try:
-                _lw = route_waypoints[min(LEAD_SPAWN_WP, len(route_waypoints) - 1)]
-                _lead_tf = carla.Transform(
-                    carla.Location(x=_lw["x"], y=_lw["y"], z=0.6),
-                    carla.Rotation(yaw=_lw["yaw"]))
-                _lead_bp = bpLibrary.filter("vehicle.tesla.model3")[0]
-                lead_vehicle = world.try_spawn_actor(_lead_bp, _lead_tf)
-                if lead_vehicle is not None:
-                    lead_vehicle.apply_control(carla.VehicleControl(brake=1.0))
-                    print(f"S5: vozilo ispred spawnano na wp[{LEAD_SPAWN_WP}] loc={_lead_tf.location}")
-                else:
-                    print(f"S5: spawn vozila ispred NIJE uspio (zauzeto?) wp={LEAD_SPAWN_WP}")
-            except Exception as _e:
-                print(f"S5: greska pri spawnu vozila ispred: {_e}")
-
-        # --- S6: kontrolirani spawn pjesaka (miruje dok ga ego ne okine) ---
-        pedestrian_released = False
-        if SPAWN_PEDESTRIAN and route_waypoints:
-            try:
-                _pw = route_waypoints[min(PED_SPAWN_WP, len(route_waypoints) - 1)]
-                _ped_tf = carla.Transform(
-                    carla.Location(x=_pw["x"] + PED_SIDE_OFFSET, y=_pw["y"], z=1.0),
-                    carla.Rotation(yaw=_pw["yaw"]))
-                _ped_bp = bpLibrary.filter("walker.pedestrian.*")[0]
-                if _ped_bp.has_attribute("is_invincible"):
-                    _ped_bp.set_attribute("is_invincible", "false")
-                pedestrian = world.try_spawn_actor(_ped_bp, _ped_tf)
-                if pedestrian is not None:
-                    print(f"S6: pjesak spawnan kod wp[{PED_SPAWN_WP}] loc={_ped_tf.location}")
-                else:
-                    print(f"S6: spawn pjesaka NIJE uspio (zauzeto?) wp={PED_SPAWN_WP}")
-            except Exception as _e:
-                print(f"S6: greska pri spawnu pjesaka: {_e}")
 
        
         while True:
@@ -1105,44 +978,6 @@ def main():
                     "cross_traffic_risk": cross_traffic_risk,
                 }
 
-                # S7: pusti nasuprotno vozilo kad ego prilazi raskrizju; ono ide RAVNO.
-                if oncoming_vehicle is not None and route_waypoints:
-                    _jwp = route_waypoints[min(ONCOMING_JUNCTION_WP, len(route_waypoints) - 1)]
-                    _dj = ((facts["x"] - _jwp["x"]) ** 2 + (facts["y"] - _jwp["y"]) ** 2) ** 0.5
-                    if _dj < ONCOMING_TRIGGER_DIST:
-                        oncoming_released = True
-                    if oncoming_released:
-                        # Konstantna, predvidljiva brzina (NE ubrzavanje iz mirovanja),
-                        # da ego moze tocno procijeniti razmak.
-                        _fwd = oncoming_vehicle.get_transform().get_forward_vector()
-                        oncoming_vehicle.set_target_velocity(
-                            carla.Vector3D(_fwd.x * ONCOMING_SPEED, _fwd.y * ONCOMING_SPEED, 0.0))
-                    else:
-                        oncoming_vehicle.apply_control(carla.VehicleControl(brake=1.0))
-
-                # S5: vozilo ispred - stoji (brake) ili konstantna spora brzina.
-                if lead_vehicle is not None:
-                    if LEAD_SPEED > 0.0:
-                        _lf = lead_vehicle.get_transform().get_forward_vector()
-                        lead_vehicle.set_target_velocity(
-                            carla.Vector3D(_lf.x * LEAD_SPEED, _lf.y * LEAD_SPEED, 0.0))
-                    else:
-                        lead_vehicle.apply_control(carla.VehicleControl(brake=1.0))
-
-                # S6: pjesak miruje dok ego ne priblizi, pa prelazi preko ego trake.
-                if pedestrian is not None and route_waypoints:
-                    _pw2 = route_waypoints[min(PED_SPAWN_WP, len(route_waypoints) - 1)]
-                    _dp = ((facts["x"] - _pw2["x"]) ** 2 + (facts["y"] - _pw2["y"]) ** 2) ** 0.5
-                    if _dp < PED_TRIGGER_DIST:
-                        pedestrian_released = True
-                    if pedestrian_released and PED_SPEED > 0.0:
-                        _cross = 1.0 if PED_SIDE_OFFSET < 0 else -1.0
-                        pedestrian.apply_control(carla.WalkerControl(
-                            direction=carla.Vector3D(x=_cross, y=0.0, z=0.0),
-                            speed=PED_SPEED))
-                    else:
-                        pedestrian.apply_control(carla.WalkerControl(speed=0.0))
-
                
                 
                 # =======================================
@@ -1180,7 +1015,6 @@ def main():
                     vehicle.apply_control(ego_action)
                     world.tick()
 
-                    # Kamera prati vozilo odozgo
                     transform = vehicle.get_transform()
                     spectator.set_transform(
                         carla.Transform(
@@ -1393,8 +1227,7 @@ def main():
                     vehicle,
                     ego_in_junction,
                     junction_ahead,
-                    ego_turning_intent,
-                    route_waypoints
+                    ego_turning_intent
                 )
 
                 # ==========================================
@@ -1411,19 +1244,16 @@ def main():
                     and ego_turning_intent != "STRAIGHT"
                 )
 
-                # Schmitt histereza: smjer se postavi na ±15, ali zadrži dok ne
-                # padne ispod ±10. Na izlazu route_dyaw visi oko -15 pa bi se
-                # route_turn_direction (i junction_route_steer) treperio -> trzaj
-                # volana ±0.2. Wrap (|route_dyaw|>15) i sam skret (~-70) netaknuti.
+                # VAŽNO: ne vjerujemo nazivu LEFT/RIGHT za predznak volana.
+                # U ovom testu route_dyaw je negativan (ruta traži desno),
+                # a raw_steer=+1.000 fizički je zakretao vozilo u suprotnu stranu
+                # prema zgradi. Zato provjeravamo predznak raw_steer prema
+                # predznaku route_dyaw, a ne prema stringu RIGHT/LEFT.
+                route_turn_direction = 0
                 if route_dyaw > 15.0:
                     route_turn_direction = 1
                 elif route_dyaw < -15.0:
                     route_turn_direction = -1
-                elif abs(route_dyaw) < 10.0:
-                    route_turn_direction = 0
-                else:
-                    # zona 10-15: zadrži prethodnu vrijednost (perzistira u petlji)
-                    route_turn_direction = locals().get("route_turn_direction", 0)
 
                 raw_steer_matches_route = (
                     route_turn_direction == 0
@@ -1750,15 +1580,6 @@ def main():
                         # Rub/trotoar: ranije uključivanje, jači gain.
                         recenter_steer = lateral_error * 0.60 + limited_yaw_term
 
-                    elif exit_recenter_counter > 0:
-                        # IZLAZ IZ RASKRIŽJA: pure-pursuit je upravo predao volan.
-                        # Ovdje je yaw_error često 8-18°, što bi inače uključilo
-                        # raw_steer-grane, a raw_steer je na izlazu mrtav/divlji signal
-                        # (skače 0.58/-0.29/1.0) pa volan trza lijevo-desno. Zato
-                        # koristimo ČISTO lateralno centriranje + ograničen yaw,
-                        # bez raw_steera. Zavoji (gdje pp nije vodio) ostaju netaknuti.
-                        recenter_steer = lateral_error * 0.45 + limited_yaw_term
-
                     elif abs(yaw_error) > 18.0:
                         # U ZAVOJU: KLJUČNA PROMJENA.
                         # Ne koristimo yaw_error za smjer volana jer mu je predznak
@@ -1838,26 +1659,22 @@ def main():
                     if raw_brake > 0.70 and not red_or_yellow_light:
                         ego_action.brake = 0.0
                         ego_action.throttle = 0.14
-                    # Crveno/žuto svjetlo: poštuj baseline kočnicu, NE daj gas.
-                    if red_or_yellow_light and raw_brake > 0.70:
-                        ego_action.throttle = 0.0
-                        ego_action.brake = max(ego_action.brake, raw_brake)
                     # Ne smije stati u zavoju.
-                    elif speed_mps > 7.0 and (hard_edge_guard_active or abs(yaw_error) > 12.0):
+                    if speed_mps > 5.0 and (hard_edge_guard_active or abs(yaw_error) > 12.0):
                         ego_action.throttle = 0.0
                         ego_action.brake = max(ego_action.brake, 0.05)
 
-                    elif speed_mps > 10.0:
+                    elif speed_mps > 4.5:
                         ego_action.brake = 0.0
-                        ego_action.throttle = 0.16
+                        ego_action.throttle = 0.10
 
-                    elif speed_mps > 6.0:
+                    elif speed_mps > 2.5:
                         ego_action.brake = 0.0
-                        ego_action.throttle = 0.42
+                        ego_action.throttle = 0.28
 
                     else:
                         ego_action.brake = 0.0
-                        ego_action.throttle = 0.60
+                        ego_action.throttle = 0.38
 
                     print(
                         f"SHIELD: curve/lane center hold active "
@@ -1895,21 +1712,6 @@ def main():
                 # ne smijemo ga pustiti u raskrižju. Tada vozimo skretanje
                 # iz route_dyaw signala, ali ograničeno i sporo, slično starom
                 # recovery ponašanju: dovoljno da skrene, ali bez punog trzaja.
-                
-                # Usporavanje SAMO neposredno pred OŠTAR skret (raskrižje blizu).
-                # junction_distance_to_entry < 12 drži kočenje lokalnim - NE usporava
-                # cijelu vožnju kao prošla verzija. Jako (0.60) jer se raskrižje
-                # detektira tek na ~10 m a auto juri ~8 m/s; ovako padne na ~2.5 m/s
-                # prije 90° luka i ne presiječe na hidrant.
-                if (
-                    abs(route_dyaw) > 60.0
-                    and route_turn_direction != 0
-                    and junction_distance_to_entry < 12.0
-                    and speed_mps > 2.5
-                ):
-                    ego_action.throttle = 0.0
-                    ego_action.brake = max(ego_action.brake, 0.60)
-
                 in_junction_turn = (
                     (turning_in_junction_zone or junction_ahead)
                     and route_turn_direction != 0
@@ -1929,7 +1731,7 @@ def main():
                     and not collision_risk_active
                     and not red_or_yellow_light
                 )
-                if in_junction_turn or pp_exit_zone or ego_in_junction or junction_ahead:
+                if in_junction_turn or pp_exit_zone:
                     junction_route_steer_active = True
                     if in_junction_turn:
                         pp_was_active = True
@@ -1937,45 +1739,28 @@ def main():
                     # U raskrižju glatko (8 m); čim izađemo, kraći lookahead (4 m)
                     # da auto tješnje priđe ruti umjesto da izlijeće široko preko
                     # sredine u suprotnu traku, pa se mora vraćati.
-                    # U samom luku (ego_in_junction) lookahead 4 m vodi skret.
-                    # Na prilazu/izlazu (izvan raskrižja) kraći 3 m: cilja bližu
-                    # točku pa kad auto izađe iz luka pomaknut u stranu, alpha je
-                    # veći i volan ga jače povuče natrag na rutu - inače se poravna
-                    # sa smjerom rute ali vozi paralelno, ~1 m sa strane.
-                    pp_lookahead = 3.0 if ego_in_junction else 3.0
-                    # Oštar skret (~90°) treba jači volan: max 0.50 ne zakrene
-                    # dovoljno pa auto zaostaje (yaw_error raste) i presiječe
-                    # unutarnji ugao (u peti skret se zabijao u hidrant). Za oštre
-                    # skretove dižemo limit; blagi ostaju na 0.50 radi stabilnosti.
-                    pp_max_steer = 0.70 if abs(route_dyaw) > 60.0 else 0.50
                     pp_steer, pp_alpha, pp_tx, pp_ty = pure_pursuit_junction_steer(
                         vehicle_location.x,
                         vehicle_location.y,
                         current_yaw_for_route,
                         route_waypoints,
-                        lookahead_m=pp_lookahead,
-                        steer_gain=0.65,
-                        max_steer=pp_max_steer,
+                        lookahead_m=4.0,
+                        steer_gain=0.55,
+                        max_steer=0.50,
                     )
                     ego_action.steer = pp_steer
 
-                   # Brzinu ograničavamo SAMO kad stvarno skrećemo. Ravni prolaz
-                    # kroz raskrižje (route_turn_direction == 0) NE usporavamo -
-                    # pursuit i dalje vodi volan (centriranje), ali brzina ostaje
-                    # krstareća. Bez ovog uvjeta pursuit (sad aktivan i na ravnim
-                    # prolazima zbog 'or junction_ahead') koči i kad ide ravno.
-                    if route_turn_direction != 0:
-                        # Sporo i kontrolirano kroz ulaz u raskrižje pri skretu.
-                        if speed_mps > 3.0:  # 2.2 je najsigurnija opcija no spora
-                            ego_action.throttle = 0.0
-                            pp_brake = 0.35 if abs(route_dyaw) > 60.0 else 0.20
-                            ego_action.brake = max(ego_action.brake, pp_brake)
-                        elif speed_mps > 1.5:
-                            ego_action.brake = 0.0
-                            ego_action.throttle = min(ego_action.throttle, 0.14)
-                        else:
-                            ego_action.brake = 0.0
-                            ego_action.throttle = max(ego_action.throttle, 0.24)
+                    # Sporo i kontrolirano kroz ulaz u raskrižje.
+                    # Ako smo prebrzi za oštar zaokret, najprije smanji brzinu.
+                    if speed_mps > 2.2:
+                        ego_action.throttle = 0.0
+                        ego_action.brake = max(ego_action.brake, 0.12)
+                    elif speed_mps > 1.5:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = min(ego_action.throttle, 0.14)
+                    else:
+                        ego_action.brake = 0.0
+                        ego_action.throttle = max(ego_action.throttle, 0.24)
 
                     print(
                         f"SHIELD: route-based junction steer active "
@@ -1991,13 +1776,7 @@ def main():
                 # (auto poravnat s njom -> mali yaw_error). Tek tada lane_recenter
                 # smije preuzeti centriranje.
                 if abs(yaw_error) <= 45.0 and abs(lateral_error) <= 0.4:
-                    if pp_was_active:
-                        # pure-pursuit upravo predaje -> kratko čisto centriranje
-                        exit_recenter_counter = 26
                     pp_was_active = False
-
-                if exit_recenter_counter > 0:
-                    exit_recenter_counter -= 1
                     
                 # Resetiraj turn-progress state TEK kad auto izađe iz raskrižja,
                 # ne čim route-steer prestane - inače se skret stalno ponovno pokreće.
@@ -2210,29 +1989,7 @@ def main():
                         "closest_distance", float("inf")
                     )
 
-                    # Obveza na skret = koliko je ego STVARNO zakrenuo od ulaska u
-                    # raskrizje (napredak skreta), NE kut rute. route_dyaw je velik
-                    # kroz CIJELI skret (i na ulazu) pa je gusio STOP svuda - zato se
-                    # ego nije zaustavljao. Sad: na ulazu (mali napredak) STOP smije
-                    # zakociti (stani u svojoj traci); tek kad je ego vec duboko
-                    # zakrenuo (u traci), dovrsi skret.
-                    if ego_in_junction and route_turn_direction != 0:
-                        if turn_entry_yaw is None:
-                            turn_entry_yaw = facts["yaw"]
-                        _tp = (facts["yaw"] - turn_entry_yaw + 180.0) % 360.0 - 180.0
-                        turn_progress = abs(_tp)
-                    else:
-                        turn_entry_yaw = None
-                        turn_progress = 0.0
-                    committed_to_turn = ego_in_junction and turn_progress > 45.0
-
-                    if committed_to_turn and intersection_risk_level in ("STOP", "YIELD"):
-                        print(
-                            f"SHIELD: INTERSECTION RISK ZANEMAREN - dovrsavam skret "
-                            f"(route_dyaw={route_dyaw:.1f}, "
-                            f"actor_id={intersection_actor_id})"
-                        )
-                    elif intersection_risk_level == "STOP":
+                    if intersection_risk_level == "STOP":
                         print(
                             f"SHIELD: INTERSECTION STOP "
                             f"intent={ego_turning_intent} "
@@ -2240,9 +1997,8 @@ def main():
                             f"ttc={intersection_time_to_closest:.2f} "
                             f"closest_dist={intersection_closest_distance:.2f}"
                         )
-                        if GAP_ACCEPTANCE_ENABLED:
-                            ego_action.throttle = 0.0
-                            ego_action.brake = max(ego_action.brake, 1.0)
+                        ego_action.throttle = 0.0
+                        ego_action.brake = max(ego_action.brake, 1.0)
 
                     elif intersection_risk_level == "YIELD":
                         print(
@@ -2252,9 +2008,9 @@ def main():
                             f"ttc={intersection_time_to_closest:.2f} "
                             f"closest_dist={intersection_closest_distance:.2f}"
                         )
-                        if GAP_ACCEPTANCE_ENABLED:
-                            ego_action.throttle = 0.0
-                            ego_action.brake = max(ego_action.brake, 0.4)
+                        ego_action.throttle = 0.0
+                        ego_action.brake = max(ego_action.brake, 0.4)
+
                 # ==========================================
                 # SHIELD: JUNCTION CREEP ASSIST
                 # ==========================================
@@ -2262,8 +2018,7 @@ def main():
                 # a nema stvarnog collision/intersection rizika ni crvenog/žutog svjetla,
                 # pusti vozilo da polako puže kroz skretanje.
                 if (
-                    (junction_turn_release_active or junction_route_steer_active
-                     or (junction_ahead and route_turn_direction == 0))
+                    (junction_turn_release_active or junction_route_steer_active)
                     and speed_mps < 1.50
                     and raw_brake > 0.70
                     and not red_or_yellow_light
@@ -2280,28 +2035,6 @@ def main():
                         f"speed={speed_mps:.2f}, "
                         f"raw_steer={raw_steer:.3f}, "
                         f"raw_brake={raw_brake:.3f})"
-                    )
-
-                # ANTI-STUCK: baseline ponekad lažno zakoči IZVAN raskrižja, na
-                # ravnoj cesti bez ikakvog stvarnog rizika (tipično kad je route_dyaw
-                # wrap-around ~±180° pa je baseline zbunjen). junction_creep pokriva
-                # samo raskrižja; ovo pokriva ravnu cestu. Ako stojimo a nema nijednog
-                # stvarnog razloga za kočenje, pusti throttle da auto nastavi.
-                if (
-                    speed_mps < 1.50
-                    and raw_brake > 0.70
-                    and not red_or_yellow_light
-                    and intersection_risk is None
-                    and not collision_risk_active
-                    and len(collision_events) == 0
-                    and not junction_creep_active
-                ):
-                    ego_action.brake = 0.0
-                    ego_action.throttle = max(ego_action.throttle, 0.40)
-                    print(
-                        f"SHIELD: anti-stuck release active "
-                        f"(speed={speed_mps:.2f}, raw_brake={raw_brake:.3f}, "
-                        f"route_dyaw={route_dyaw:.1f})"
                     )
 
                 # ==========================================
@@ -2443,46 +2176,6 @@ def main():
 
                 last_collision_count = len(collision_events)
 
-                if route_waypoints:
-                    # Najbliži waypoint PO INDEKSU - razlikuje kraj rute od početka.
-                    # Ruta se vrati blizu starta (kraj ~(190,250) je 6 m od prvog
-                    # segmenta) pa sama udaljenost lažno okida već na početku.
-                    _bi = 0
-                    _bd2 = float("inf")
-                    for _i, _wp in enumerate(route_waypoints):
-                        _d2 = ((vehicle_location.x - _wp["x"]) ** 2 +
-                               (vehicle_location.y - _wp["y"]) ** 2)
-                        if _d2 < _bd2:
-                            _bd2 = _d2
-                            _bi = _i
-                    # Zaustavi tek kad smo kod ZADNJIH waypointa (prošli cijelu rutu) I blizu.
-                    if _bi >= len(route_waypoints) - 1 and _bd2 ** 0.5 < 6.0:
-                        ego_action.throttle = 0.0
-                        ego_action.brake = 1.0
-                        ego_action.steer = 0.0
-                        print(f"RUTA ZAVRŠENA: cilj dosegnut (idx={_bi}/{len(route_waypoints)-1}), zaustavljam.")
-
-
-                # BASELINE NAČIN: kad je shield isključen, primijeni ČISTI baseline
-                # (raw vrijednosti). Sva shield logika iznad je svejedno izračunata
-                # i logirana, ali se NE primjenjuje - usporedba je poštena.
-                if not SHIELD_ENABLED:
-                    ego_action.steer = float(raw_steer)
-                    ego_action.throttle = float(raw_throttle)
-                    ego_action.brake = float(raw_brake)
-
-                # CSV redak (PRIMIJENJENE vrijednosti)
-                _csv.write(
-                    f"{step},{_mode},{facts['x']:.3f},{facts['y']:.3f},"
-                    f"{facts['yaw']:.2f},{facts['speed_mps']:.3f},"
-                    f"{raw_steer:.3f},{ego_action.steer:.3f},"
-                    f"{raw_throttle:.3f},{ego_action.throttle:.3f},"
-                    f"{raw_brake:.3f},{ego_action.brake:.3f},"
-                    f"{lateral_error:.3f},{yaw_error:.3f},{len(collision_events)},"
-                    f"{intersection_risk_level},{ego_turning_intent},{route_intent},"
-                    f"{lane_recenter_active},{junction_route_steer_active}\n"
-                )
-
                 vehicle.apply_control(ego_action)
                 world.tick()
 
@@ -2518,30 +2211,6 @@ def main():
                 world.apply_settings(settings)
             except Exception as error:
                 print(f"Warning: failed to restore world settings: {error}")
-
-        try:
-            _csv.close()
-            print(f"CSV spremljen: {_csv_name}")
-        except Exception:
-            pass
-
-        if oncoming_vehicle is not None:
-            try:
-                oncoming_vehicle.destroy()
-            except Exception:
-                pass
-
-        if lead_vehicle is not None:
-            try:
-                lead_vehicle.destroy()
-            except Exception:
-                pass
-
-        if pedestrian is not None:
-            try:
-                pedestrian.destroy()
-            except Exception:
-                pass
 
         print('\nCleaning up actors')
 

@@ -2,11 +2,19 @@ Pokretanje sample.py:
         conda activate pcla-win
         cd C:\Users\Antonela\Documents\PCLA-main
         python sample.py
+        python sample.py > log_full.txt 2>&1 (ako zelis ispis loga u .txt datoteci)
 
 Dodavanje pješaka i vozila:
         conda activate pcla-win
         cd C:\Users\Antonela\Documents\CARLA_0.9.16\PythonAPI\examples
-        python generate_traffic.py --number-of-vehicles 5 --number-of-walkers 3 --tm-port 8000
+        python generate_traffic.py --number-of-vehicles 10 --number-of-walkers 7 --tm-port 8000
+
+Skripta za analizu rezultata testiranja
+        # sve metrics CSV u folderu, uz rutu (da računa je li ruta završena):
+        python analyze_metrics.py --route route_spawn0.xml
+        # ili konkretni fajlovi:
+        python analyze_metrics.py --route route_spawn0.xml metrics_shield.csv metrics_baseline.csv
+
 
 Varijable shella:
         step — broj iteracije simulacije

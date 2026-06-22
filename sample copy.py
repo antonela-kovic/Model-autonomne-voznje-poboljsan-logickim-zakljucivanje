@@ -737,16 +737,16 @@ def main():
 
     # Glavni prekidač za usporedbu: True = baseline + logički shield sloj,
     # False = ČISTI baseline (neat_neat bez shielda). Ista ruta/kod/mjerenja.
-    SHIELD_ENABLED = True
+    SHIELD_ENABLED = False
     # Ablacija gap-acceptancea (S7): True = shield propusta (normalno),
     # False = shield skrece ali NE propusta -> ulijece u nasuprotno vozilo.
     # Djeluje samo kad je SHIELD_ENABLED=True; ostatak shielda netaknut.
-    GAP_ACCEPTANCE_ENABLED = False
+    GAP_ACCEPTANCE_ENABLED = True
 
     # --- Kontrolirani scenarij S7: nasuprotno vozilo koje presijeca ego skret ---
     # Stoji na nasuprotnom prilazu dok ga ego ne "okine" (priblizi se raskrizju),
     # pa krene RAVNO kroz raskrizje. Sluzi za ugadjanje gap-acceptance pravila.
-    SPAWN_ONCOMING = True         # True = ukljuci nasuprotno vozilo (S7 kalibracija; vrati na False za normalne voznje)
+    SPAWN_ONCOMING = False         # True = ukljuci nasuprotno vozilo (S7 kalibracija; vrati na False za normalne voznje)
     ONCOMING_SPAWN_INDEX = 45      # spawn na suprotnoj traci, sjeverno od raskrizja (presijeca ego lijevi skret)
     ONCOMING_JUNCTION_WP = 26      # waypoint skreta rute na (0.5,191.5)
     ONCOMING_TRIGGER_DIST = 14.0   # ego unutar ove udaljenosti od raskrizja -> pusti vozilo
@@ -754,12 +754,12 @@ def main():
 
     # --- Kontrolirani scenarij S5: sporo/stojece vozilo U ISTOJ TRACI ispred ega ---
     # Na ravnom prilazu PRIJE skreta (baseline tu vozi normalno) -> cist test koci li ego.
-    SPAWN_LEAD = False             # True = ukljuci vozilo ispred (S5)
+    SPAWN_LEAD = False            # True = ukljuci vozilo ispred (S5)
     LEAD_SPAWN_WP = 18             # route waypoint za spawn (wp ~2 m; 18 -> ~35 m ispred ega)
     LEAD_SPEED = float(os.environ.get("LEAD_SPEED", 0.0))  # 0 = stoji; >0 = konstantna spora brzina (m/s)
 
     # --- Kontrolirani scenarij S6: pjesak na ego putanji ---
-    SPAWN_PEDESTRIAN = False       # True = ukljuci pjesaka (S6)
+    SPAWN_PEDESTRIAN = True        # True = ukljuci pjesaka (S6)
     PED_SPAWN_WP = 14              # route waypoint oko kojeg se pjesak postavlja (~27 m ispred)
     PED_SIDE_OFFSET = -4.0         # poprecni pomak od sredine trake (m); 0 = stoji u traci
     PED_TRIGGER_DIST = 12.0        # ego unutar ove udaljenosti -> pjesak krene prelaziti
