@@ -30,9 +30,12 @@ summary.csv
 summary_grouped.csv
 summary_*.csv
 
-pcla_agents/*_pretrained/
-
 # NAPOMENA:
 # tests/metrics_*.csv (rezultati mjerenja) se NAMJERNO gurnu na GitHub.
 # Ako su preveliki ili ih ne zelis u repou, dodaj liniju:
 # tests/metrics_*.csv
+
+# --- PCLA / transfuser pretrained tezine (velike, trecestrane, ugnijezdeni git repo) ---
+# NE idu na GitHub. Ako ti trebaju za reprodukciju, navedi u README odakle ih skinuti.
+pcla_agents/*_pretrained/
+**/.git/
